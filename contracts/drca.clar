@@ -269,3 +269,68 @@
     u0
   )
 )
+
+
+
+(define-map recovery-notifications
+  { beneficiary: principal }
+  { pending-recoveries: (list 25 { user: principal, asset-id: (string-utf8 36) }) }
+)
+
+(define-read-only (get-pending-recoveries (beneficiary principal))
+  (default-to 
+    { pending-recoveries: (list) }
+    (map-get? recovery-notifications { beneficiary: beneficiary })
+  )
+)
+
+(define-public (notify-recovery (beneficiary principal) (asset-id (string-utf8 36)))
+  (let (
+    (user tx-sender)
+    (current-notifications (get-pending-recoveries beneficiary))
+    (new-notification { user: user, asset-id: asset-id })
+    (current-list (get pending-recoveries current-notifications))
+  )
+    (asserts! (< (len current-list) u25) (err u112))
+    (map-set recovery-notifications
+      { beneficiary: beneficiary }
+      { pending-recoveries: (unwrap! (as-max-len? (append current-list new-notification) u25) (err u112)) }
+    )
+    (ok true)
+  )
+)
+
+(define-public (clear-notifications (beneficiary principal))
+  (let (
+    (user tx-sender)
+    (current-notifications (get-pending-recoveries beneficiary))
+  )
+    (asserts! (is-eq user beneficiary) err-unauthorized)
+    
+    (map-set recovery-notifications
+      { beneficiary: beneficiary }
+      { pending-recoveries: (list) }
+    )
+    (ok true)
+  )
+)
+(define-public (get-recovery-notifications (beneficiary principal))
+  (let (
+    (user tx-sender)
+    (current-notifications (get-pending-recoveries beneficiary))
+  )
+    (asserts! (is-eq user beneficiary) err-unauthorized)
+    
+    (ok (get pending-recoveries current-notifications))
+  )
+)
+(define-public (get-recovery-notification-count (beneficiary principal))
+  (let (
+    (user tx-sender)
+    (current-notifications (get-pending-recoveries beneficiary))
+  )
+    (asserts! (is-eq user beneficiary) err-unauthorized)
+    
+    (ok (len (get pending-recoveries current-notifications)))
+  )
+)
