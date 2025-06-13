@@ -10,6 +10,13 @@
 (define-constant err-recovery-period-not-elapsed (err u109))
 (define-constant err-self-appointment (err u110))
 (define-constant err-max-beneficiaries-reached (err u111))
+(define-constant err-emergency-contact-exists (err u200))
+(define-constant err-emergency-contact-not-found (err u201))
+(define-constant err-cannot-freeze-own-recovery (err u202))
+(define-constant err-recovery-already-frozen (err u203))
+(define-constant err-recovery-not-frozen (err u204))
+(define-constant err-freeze-expired (err u205))
+(define-constant err-max-emergency-contacts-reached (err u206))
 
 (define-constant max-beneficiaries u5)
 (define-constant min-recovery-period u1440) ;; minimum 1 day (in blocks)
@@ -332,5 +339,183 @@
     (asserts! (is-eq user beneficiary) err-unauthorized)
     
     (ok (len (get pending-recoveries current-notifications)))
+  )
+)
+
+
+
+(define-constant max-emergency-contacts u3)
+(define-constant freeze-duration u2016)
+
+(define-map emergency-contacts
+  { user: principal, contact: principal }
+  { 
+    active: bool,
+    added-block: uint
+  }
+)
+
+(define-map recovery-freezes
+  { user: principal, beneficiary: principal }
+  { 
+    frozen: bool,
+    freeze-block: uint,
+    frozen-by: principal
+  }
+)
+
+(define-read-only (get-emergency-contact-info (user principal) (contact principal))
+  (default-to 
+    { active: false, added-block: u0 }
+    (map-get? emergency-contacts { user: user, contact: contact })
+  )
+)
+
+(define-read-only (get-recovery-freeze-info (user principal) (beneficiary principal))
+  (default-to 
+    { frozen: false, freeze-block: u0, frozen-by : user }
+    (map-get? recovery-freezes { user: user, beneficiary: beneficiary })
+  )
+)
+
+(define-read-only (is-emergency-contact (user principal) (contact principal))
+  (get active (get-emergency-contact-info user contact))
+)
+
+(define-read-only (is-recovery-frozen (user principal) (beneficiary principal))
+  (let (
+    (freeze-info (get-recovery-freeze-info user beneficiary))
+  )
+    (and
+      (get frozen freeze-info)
+      (< stacks-block-height (+ (get freeze-block freeze-info) freeze-duration))
+    )
+  )
+)
+
+(define-read-only (get-emergency-contact-count (user principal))
+  (fold + (map check-if-emergency-contact (list-potential-contacts user)) u0)
+)
+
+(define-read-only (list-potential-contacts (user principal))
+  (list 
+    tx-sender
+    'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+    'ST2CY5V39NHDPWSXMW9QDT3HC3GD6Q6XX4CFRK9AG
+    'ST2JHG361ZXG51QTKY2NQCVBPPRRE2KZB1HR05NNC
+    'ST2NEB84ASENDXKYGJPQW86YXQCEFEX2ZQPG87ND
+  )
+)
+
+(define-private (check-if-emergency-contact (potential-contact principal))
+  (if (is-emergency-contact tx-sender potential-contact)
+    u1
+    u0
+  )
+)
+
+(define-public (add-emergency-contact (contact principal))
+  (let (
+    (user tx-sender)
+    (current-contacts (get-emergency-contact-count user))
+  )
+    (asserts! (not (is-eq user contact)) err-unauthorized)
+    (asserts! (< current-contacts max-emergency-contacts) err-max-emergency-contacts-reached)
+    (asserts! (not (is-emergency-contact user contact)) err-emergency-contact-exists)
+    
+    (map-set emergency-contacts
+      { user: user, contact: contact }
+      { 
+        active: true,
+        added-block: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (remove-emergency-contact (contact principal))
+  (let (
+    (user tx-sender)
+  )
+    (asserts! (is-emergency-contact user contact) err-emergency-contact-not-found)
+    
+    (map-delete emergency-contacts { user: user, contact: contact })
+    (ok true)
+  )
+)
+
+(define-public (freeze-recovery (user principal) (beneficiary principal))
+  (let (
+    (contact tx-sender)
+    (freeze-info (get-recovery-freeze-info user beneficiary))
+  )
+    (asserts! (is-emergency-contact user contact) err-unauthorized)
+    (asserts! (not (is-eq contact beneficiary)) err-cannot-freeze-own-recovery)
+    (asserts! (not (get frozen freeze-info)) err-recovery-already-frozen)
+    
+    (map-set recovery-freezes
+      { user: user, beneficiary: beneficiary }
+      { 
+        frozen: true,
+        freeze-block: stacks-block-height,
+        frozen-by: contact
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (unfreeze-recovery (user principal) (beneficiary principal))
+  (let (
+    (caller tx-sender)
+    (freeze-info (get-recovery-freeze-info user beneficiary))
+  )
+    (asserts! (get frozen freeze-info) err-recovery-not-frozen)
+    (asserts! (or 
+      (is-eq caller user)
+      (is-eq caller (get frozen-by freeze-info))
+    ) err-unauthorized)
+    
+    (map-set recovery-freezes
+      { user: user, beneficiary: beneficiary }
+      { 
+        frozen: false,
+        freeze-block: u0,
+        frozen-by: 'ST000000000000000000002AMW42H
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (check-recovery-status (user principal) (beneficiary principal))
+  (let (
+    (freeze-info (get-recovery-freeze-info user beneficiary))
+  )
+    (if (and 
+      (get frozen freeze-info)
+      (>= stacks-block-height (+ (get freeze-block freeze-info) freeze-duration))
+    )
+      (begin
+        (map-set recovery-freezes
+          { user: user, beneficiary: beneficiary }
+          { 
+            frozen: false,
+            freeze-block: u0,
+            frozen-by: 'ST000000000000000000002AMW42H
+          }
+        )
+        (ok { frozen: false, auto-expired: true })
+      )
+      (ok { frozen: (is-recovery-frozen user beneficiary), auto-expired: false })
+    )
+  )
+)
+
+(define-read-only (can-recover-with-freeze-check (user principal) (beneficiary principal))
+  (and
+    (not (is-recovery-frozen user beneficiary))
+    true
   )
 )
