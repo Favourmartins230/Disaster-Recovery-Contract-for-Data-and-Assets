@@ -519,3 +519,137 @@
     true
   )
 )
+
+(define-constant err-vault-not-found (err u300))
+(define-constant err-vault-still-locked (err u301))
+(define-constant err-vault-already-exists (err u302))
+(define-constant err-insufficient-balance (err u303))
+(define-constant err-invalid-unlock-time (err u304))
+
+(define-constant min-lock-duration u144)
+(define-constant max-vaults-per-user u10)
+
+(define-map time-locked-vaults
+  { user: principal, vault-id: (string-utf8 32) }
+  {
+    amount: uint,
+    unlock-block: uint,
+    created-block: uint,
+    beneficiary: (optional principal)
+  }
+)
+
+(define-read-only (get-vault-info (user principal) (vault-id (string-utf8 32)))
+  (map-get? time-locked-vaults { user: user, vault-id: vault-id })
+)
+
+(define-read-only (get-vault-count (user principal))
+  (fold + (map check-vault-exists (generate-vault-ids)) u0)
+)
+
+(define-read-only (generate-vault-ids)
+  (list 
+    u"vault-1" u"vault-2" u"vault-3" u"vault-4" u"vault-5"
+    u"vault-6" u"vault-7" u"vault-8" u"vault-9" u"vault-10"
+  )
+)
+
+(define-private (check-vault-exists (vault-id (string-utf8 32)))
+  (if (is-some (get-vault-info tx-sender vault-id))
+    u1
+    u0
+  )
+)
+
+(define-read-only (is-vault-unlocked (user principal) (vault-id (string-utf8 32)))
+  (match (get-vault-info user vault-id)
+    vault-data (>= stacks-block-height (get unlock-block vault-data))
+    false
+  )
+)
+
+(define-public (create-time-locked-vault (vault-id (string-utf8 32)) (amount uint) (lock-duration uint) (beneficiary (optional principal)))
+  (let (
+    (user tx-sender)
+    (unlock-block (+ stacks-block-height lock-duration))
+    (current-vaults (get-vault-count user))
+  )
+    (asserts! (is-none (get-vault-info user vault-id)) err-vault-already-exists)
+    (asserts! (>= lock-duration min-lock-duration) err-invalid-unlock-time)
+    (asserts! (< current-vaults max-vaults-per-user) err-max-beneficiaries-reached)
+    (asserts! (>= (stx-get-balance user) amount) err-insufficient-balance)
+    
+    (try! (stx-transfer? amount user (as-contract tx-sender)))
+    
+    (map-set time-locked-vaults
+      { user: user, vault-id: vault-id }
+      {
+        amount: amount,
+        unlock-block: unlock-block,
+        created-block: stacks-block-height,
+        beneficiary: beneficiary
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (withdraw-from-vault (vault-id (string-utf8 32)))
+  (let (
+    (user tx-sender)
+    (vault-data (unwrap! (get-vault-info user vault-id) err-vault-not-found))
+  )
+    (asserts! (>= stacks-block-height (get unlock-block vault-data)) err-vault-still-locked)
+    
+    (try! (as-contract (stx-transfer? (get amount vault-data) tx-sender user)))
+    
+    (map-delete time-locked-vaults { user: user, vault-id: vault-id })
+    (ok (get amount vault-data))
+  )
+)
+
+(define-public (claim-vault-as-beneficiary (user principal) (vault-id (string-utf8 32)))
+  (let (
+    (beneficiary tx-sender)
+    (vault-data (unwrap! (get-vault-info user vault-id) err-vault-not-found))
+    (vault-beneficiary (unwrap! (get beneficiary vault-data) err-unauthorized))
+  )
+    (asserts! (is-eq beneficiary vault-beneficiary) err-unauthorized)
+    (asserts! (>= stacks-block-height (get unlock-block vault-data)) err-vault-still-locked)
+    
+    (try! (as-contract (stx-transfer? (get amount vault-data) tx-sender beneficiary)))
+    
+    (map-delete time-locked-vaults { user: user, vault-id: vault-id })
+    (ok (get amount vault-data))
+  )
+)
+
+(define-public (update-vault-beneficiary (vault-id (string-utf8 32)) (new-beneficiary (optional principal)))
+  (let (
+    (user tx-sender)
+    (vault-data (unwrap! (get-vault-info user vault-id) err-vault-not-found))
+  )
+    (map-set time-locked-vaults
+      { user: user, vault-id: vault-id }
+      (merge vault-data { beneficiary: new-beneficiary })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-vault-status (user principal) (vault-id (string-utf8 32)))
+  (match (get-vault-info user vault-id)
+    vault-data 
+    (ok {
+      exists: true,
+      amount: (get amount vault-data),
+      unlock-block: (get unlock-block vault-data),
+      blocks-remaining: (if (> (get unlock-block vault-data) stacks-block-height)
+                         (- (get unlock-block vault-data) stacks-block-height)
+                         u0),
+      is-unlocked: (>= stacks-block-height (get unlock-block vault-data)),
+      beneficiary: (get beneficiary vault-data)
+    })
+    (ok { exists: false, amount: u0, unlock-block: u0, blocks-remaining: u0, is-unlocked: false, beneficiary: none })
+  )
+)
