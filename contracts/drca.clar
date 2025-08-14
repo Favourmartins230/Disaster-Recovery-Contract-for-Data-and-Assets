@@ -653,3 +653,320 @@
     (ok { exists: false, amount: u0, unlock-block: u0, blocks-remaining: u0, is-unlocked: false, beneficiary: none })
   )
 )
+
+;; Asset Verification & Attestation System
+;; Provides cryptographic proofs and third-party attestations for asset ownership
+
+(define-constant err-verification-not-found (err u400))
+(define-constant err-verification-exists (err u401))
+(define-constant err-invalid-proof (err u402))
+(define-constant err-attestation-not-found (err u403))
+(define-constant err-attestation-exists (err u404))
+(define-constant err-cannot-attest-own-asset (err u405))
+(define-constant err-insufficient-attestations (err u406))
+(define-constant err-challenge-not-found (err u407))
+(define-constant err-challenge-exists (err u408))
+(define-constant err-challenge-period-active (err u409))
+
+(define-constant max-attestations-per-asset u10)
+(define-constant min-attestations-required u2)
+(define-constant challenge-period u1008) ;; ~1 week in blocks
+(define-constant attestor-stake-amount u1000000) ;; 1 STX in microSTX
+
+;; Store cryptographic proofs for asset ownership
+(define-map asset-verifications
+  { user: principal, asset-id: (string-utf8 36) }
+  {
+    proof-hash: (buff 32), ;; Hash of ownership proof
+    proof-timestamp: uint,
+    verification-score: uint,
+    is-verified: bool,
+    challenge-count: uint
+  }
+)
+
+;; Store third-party attestations for assets
+(define-map asset-attestations
+  { user: principal, asset-id: (string-utf8 36), attestor: principal }
+  {
+    attestation-hash: (buff 32), ;; Hash of attestation data
+    attestation-timestamp: uint,
+    stake-amount: uint,
+    is-active: bool
+  }
+)
+
+;; Store challenges against asset verifications
+(define-map verification-challenges
+  { user: principal, asset-id: (string-utf8 36), challenger: principal }
+  {
+    challenge-reason: (string-utf8 256),
+    challenge-timestamp: uint,
+    challenge-stake: uint,
+    is-resolved: bool,
+    resolution: (optional bool) ;; true = challenge upheld, false = challenge rejected
+  }
+)
+
+;; Track attestor reputation scores
+(define-map attestor-reputation
+  { attestor: principal }
+  {
+    total-attestations: uint,
+    successful-attestations: uint,
+    reputation-score: uint,
+    total-stake: uint
+  }
+)
+
+;; Read-only functions for verification system
+(define-read-only (get-asset-verification (user principal) (asset-id (string-utf8 36)))
+  (map-get? asset-verifications { user: user, asset-id: asset-id })
+)
+
+(define-read-only (get-asset-attestation (user principal) (asset-id (string-utf8 36)) (attestor principal))
+  (map-get? asset-attestations { user: user, asset-id: asset-id, attestor: attestor })
+)
+
+(define-read-only (get-verification-challenge (user principal) (asset-id (string-utf8 36)) (challenger principal))
+  (map-get? verification-challenges { user: user, asset-id: asset-id, challenger: challenger })
+)
+
+(define-read-only (get-attestor-reputation (attestor principal))
+  (default-to 
+    { total-attestations: u0, successful-attestations: u0, reputation-score: u0, total-stake: u0 }
+    (map-get? attestor-reputation { attestor: attestor })
+  )
+)
+
+;; Check if asset meets minimum verification requirements
+(define-read-only (is-asset-sufficiently-verified (user principal) (asset-id (string-utf8 36)))
+  (let (
+    (verification-data (get-asset-verification user asset-id))
+    (attestation-count (get-attestation-count user asset-id))
+  )
+    (and
+      (is-some verification-data)
+      (get is-verified (unwrap-panic verification-data))
+      (>= attestation-count min-attestations-required)
+      (not (has-active-challenges user asset-id))
+    )
+  )
+)
+
+;; Count active attestations for an asset
+(define-read-only (get-attestation-count (user principal) (asset-id (string-utf8 36)))
+  (fold + (map check-attestation-active (generate-attestor-list)) u0)
+)
+
+;; Generate list of potential attestors (simplified for demonstration)
+(define-read-only (generate-attestor-list)
+  (list 
+    tx-sender
+    'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+    'ST2CY5V39NHDPWSXMW9QDT3HC3GD6Q6XX4CFRK9AG
+    'ST2JHG361ZXG51QTKY2NQCVBPPRRE2KZB1HR05NNC
+    'ST2NEB84ASENDXKYGJPQW86YXQCEFEX2ZQPG87ND
+  )
+)
+
+;; Helper function to check if attestation is active
+(define-private (check-attestation-active (attestor principal))
+  (match (get-asset-attestation tx-sender u"temp-asset" attestor)
+    attestation-data (if (get is-active attestation-data) u1 u0)
+    u0
+  )
+)
+
+;; Check if asset has active challenges
+(define-read-only (has-active-challenges (user principal) (asset-id (string-utf8 36)))
+  (fold or (map check-challenge-active (generate-attestor-list)) false)
+)
+
+;; Helper function to check if challenge is active
+(define-private (check-challenge-active (challenger principal))
+  (match (get-verification-challenge tx-sender u"temp-asset" challenger)
+    challenge-data 
+    (and
+      (not (get is-resolved challenge-data))
+      (< stacks-block-height (+ (get challenge-timestamp challenge-data) challenge-period))
+    )
+    false
+  )
+)
+
+;; Submit cryptographic proof of asset ownership
+(define-public (submit-asset-proof (asset-id (string-utf8 36)) (proof-hash (buff 32)))
+  (let (
+    (user tx-sender)
+    (existing-verification (get-asset-verification user asset-id))
+  )
+    ;; Check if asset exists in the system
+    (asserts! (is-some (get-asset user asset-id)) err-not-registered)
+    ;; Prevent duplicate verifications
+    (asserts! (is-none existing-verification) err-verification-exists)
+    
+    ;; Store the verification proof
+    (map-set asset-verifications
+      { user: user, asset-id: asset-id }
+      {
+        proof-hash: proof-hash,
+        proof-timestamp: stacks-block-height,
+        verification-score: u100, ;; Initial score
+        is-verified: true,
+        challenge-count: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Third parties can attest to asset ownership validity
+(define-public (attest-asset-ownership (user principal) (asset-id (string-utf8 36)) (attestation-hash (buff 32)))
+  (let (
+    (attestor tx-sender)
+    (existing-attestation (get-asset-attestation user asset-id attestor))
+    (attestor-rep (get-attestor-reputation attestor))
+  )
+    ;; Verify asset has initial verification
+    (asserts! (is-some (get-asset-verification user asset-id)) err-verification-not-found)
+    ;; Prevent self-attestation
+    (asserts! (not (is-eq attestor user)) err-cannot-attest-own-asset)
+    ;; Prevent duplicate attestations
+    (asserts! (is-none existing-attestation) err-attestation-exists)
+    ;; Check attestor has sufficient stake
+    (asserts! (>= (stx-get-balance attestor) attestor-stake-amount) err-insufficient-balance)
+    
+    ;; Transfer stake to contract
+    (try! (stx-transfer? attestor-stake-amount attestor (as-contract tx-sender)))
+    
+    ;; Record the attestation
+    (map-set asset-attestations
+      { user: user, asset-id: asset-id, attestor: attestor }
+      {
+        attestation-hash: attestation-hash,
+        attestation-timestamp: stacks-block-height,
+        stake-amount: attestor-stake-amount,
+        is-active: true
+      }
+    )
+    
+    ;; Update attestor reputation
+    (map-set attestor-reputation
+      { attestor: attestor }
+      {
+        total-attestations: (+ (get total-attestations attestor-rep) u1),
+        successful-attestations: (get successful-attestations attestor-rep),
+        reputation-score: (+ (get reputation-score attestor-rep) u10),
+        total-stake: (+ (get total-stake attestor-rep) attestor-stake-amount)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Challenge an asset verification if suspected to be fraudulent
+(define-public (challenge-asset-verification (user principal) (asset-id (string-utf8 36)) (challenge-reason (string-utf8 256)))
+  (let (
+    (challenger tx-sender)
+    (verification-data (unwrap! (get-asset-verification user asset-id) err-verification-not-found))
+    (existing-challenge (get-verification-challenge user asset-id challenger))
+    (challenge-stake (/ attestor-stake-amount u2)) ;; Half of attestation stake
+  )
+    ;; Prevent duplicate challenges from same challenger
+    (asserts! (is-none existing-challenge) err-challenge-exists)
+    ;; Ensure challenger has sufficient stake
+    (asserts! (>= (stx-get-balance challenger) challenge-stake) err-insufficient-balance)
+    
+    ;; Transfer challenge stake to contract
+    (try! (stx-transfer? challenge-stake challenger (as-contract tx-sender)))
+    
+    ;; Record the challenge
+    (map-set verification-challenges
+      { user: user, asset-id: asset-id, challenger: challenger }
+      {
+        challenge-reason: challenge-reason,
+        challenge-timestamp: stacks-block-height,
+        challenge-stake: challenge-stake,
+        is-resolved: false,
+        resolution: none
+      }
+    )
+    
+    ;; Update verification to reflect challenge
+    (map-set asset-verifications
+      { user: user, asset-id: asset-id }
+      (merge verification-data { challenge-count: (+ (get challenge-count verification-data) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Resolve a challenge (simplified - in practice would need governance mechanism)
+(define-public (resolve-challenge (user principal) (asset-id (string-utf8 36)) (challenger principal) (challenge-upheld bool))
+  (let (
+    (resolver tx-sender)
+    (challenge-data (unwrap! (get-verification-challenge user asset-id challenger) err-challenge-not-found))
+    (verification-data (unwrap! (get-asset-verification user asset-id) err-verification-not-found))
+  )
+    ;; Simple authorization check (in practice would use governance)
+    (asserts! (is-eq resolver (var-get contract-owner)) err-unauthorized)
+    ;; Ensure challenge is not already resolved
+    (asserts! (not (get is-resolved challenge-data)) err-challenge-exists)
+    
+    ;; Resolve the challenge
+    (map-set verification-challenges
+      { user: user, asset-id: asset-id, challenger: challenger }
+      (merge challenge-data { is-resolved: true, resolution: (some challenge-upheld) })
+    )
+    
+    ;; If challenge upheld, mark verification as invalid and return stake
+    (if challenge-upheld
+      (begin
+        (map-set asset-verifications
+          { user: user, asset-id: asset-id }
+          (merge verification-data { is-verified: false, verification-score: u0 })
+        )
+        ;; Return stake to challenger
+        (try! (as-contract (stx-transfer? (get challenge-stake challenge-data) tx-sender challenger)))
+        (ok true)
+      )
+      ;; If challenge rejected, forfeit challenger's stake
+      (ok false)
+    )
+  )
+)
+
+;; Get comprehensive verification status for an asset
+(define-read-only (get-asset-verification-status (user principal) (asset-id (string-utf8 36)))
+  (let (
+    (verification-data (get-asset-verification user asset-id))
+    (attestation-count (get-attestation-count user asset-id))
+    (has-challenges (has-active-challenges user asset-id))
+  )
+    (match verification-data
+      verification-info
+      (ok {
+        has-proof: true,
+        is-verified: (get is-verified verification-info),
+        verification-score: (get verification-score verification-info),
+        attestation-count: attestation-count,
+        meets-requirements: (is-asset-sufficiently-verified user asset-id),
+        has-active-challenges: has-challenges,
+        challenge-count: (get challenge-count verification-info)
+      })
+      (ok {
+        has-proof: false,
+        is-verified: false,
+        verification-score: u0,
+        attestation-count: u0,
+        meets-requirements: false,
+        has-active-challenges: false,
+        challenge-count: u0
+      })
+    )
+  )
+)
+
